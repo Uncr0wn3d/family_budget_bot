@@ -1,127 +1,138 @@
 import os
 import asyncio
-import logging
+import re
 from datetime import datetime, timedelta
 import pytz
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiogram.fsm.context import FContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from aiohttp import web
 import database as db
 
-# Настройки
 TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_USERS = [int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x]
 WARSAW_TZ = pytz.timezone('Europe/Warsaw')
 
-logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- Логика расчета периода ЗП ---
+class Form(StatesGroup):
+    waiting_for_input = State()
 
+# --- Логика ЗП ---
 def get_payday(year, month):
-    """Рассчитывает дату ЗП: 10 число или пятница, если 10-е - это Сб или Вс"""
     dt = datetime(year, month, 10)
-    # 5 - Суббота, 6 - Воскресенье
-    if dt.weekday() == 5: 
-        return dt - timedelta(days=1) # Пятница 9-е
-    if dt.weekday() == 6:
-        return dt - timedelta(days=2) # Пятница 8-е
+    if dt.weekday() == 5: return dt - timedelta(days=1)
+    if dt.weekday() == 6: return dt - timedelta(days=2)
     return dt
 
 def get_current_cycle():
-    """Определяет начало и конец текущего финансового месяца"""
     now = datetime.now(WARSAW_TZ).replace(tzinfo=None)
-    this_month_payday = get_payday(now.year, now.month)
-    
-    if now <= this_month_payday:
-        # Мы еще в цикле, который начался после ЗП прошлого месяца
-        last_month = now.replace(day=1) - timedelta(days=1)
-        start_date = get_payday(last_month.year, last_month.month) + timedelta(days=1)
-        end_date = this_month_payday
+    this_payday = get_payday(now.year, now.month)
+    if now <= this_payday:
+        last = now.replace(day=1) - timedelta(days=1)
+        start = get_payday(last.year, last.month) + timedelta(days=1)
+        end = this_payday
     else:
-        # Мы в цикле, который начался после ЗП этого месяца
-        next_month = (now.replace(day=28) + timedelta(days=5)).replace(day=1)
-        start_date = this_month_payday + timedelta(days=1)
-        end_date = get_payday(next_month.year, next_month.month)
-        
-    return start_date.strftime("%Y-%m-%d 00:00:00"), end_date.strftime("%Y-%m-%d 23:59:59")
+        nxt = (now.replace(day=28) + timedelta(days=5)).replace(day=1)
+        start = this_payday + timedelta(days=1)
+        end = get_payday(nxt.year, nxt.month)
+    return start.strftime("%Y-%m-%d 00:00:00"), end.strftime("%Y-%m-%d 23:59:59")
 
-# --- Интерфейс ---
-
+# --- Клавиатуры ---
 def main_kb():
     builder = ReplyKeyboardBuilder()
-    builder.button(text="🍎 Еда")
-    builder.button(text="📦 Прочее")
-    builder.button(text="📊 Отчет")
+    builder.button(text="🍎 Jedzenie"), builder.button(text="📦 Inne")
+    builder.button(text="📊 Raport"), builder.button(text="🕒 Historia")
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
+def delete_kb(expense_id):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="❌ Usuń", callback_data=f"del_{expense_id}")
+    return builder.as_markup()
+
+# --- Обработчики ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.from_user.id not in ALLOWED_USERS: return
-    await message.answer("Cześć! Введи сумму (только цифры), а потом выбери категорию.", reply_markup=main_kb())
+    await message.answer("Cześć! Wybierz kategorię:", reply_markup=main_kb())
 
-user_temp_data = {}
-
-@dp.message(F.text.regexp(r'^\d+(\.\d+)?$'))
-async def get_amount(message: types.Message):
+@dp.message(F.text.in_(["🍎 Jedzenie", "📦 Inне"])) # Принимаем и старый и новый текст для совместимости
+@dp.message(F.text.in_(["🍎 Jedzenie", "📦 Inne"]))
+async def select_category(message: types.Message, state: FContext):
     if message.from_user.id not in ALLOWED_USERS: return
-    user_temp_data[message.from_user.id] = float(message.text)
-    await message.answer(f"Сумма {message.text} zł принята. Категория?", reply_markup=main_kb())
+    category = "Jedzenie" if "Jedzenie" in message.text else "Inne"
+    await state.update_data(selected_category=category)
+    await state.set_state(Form.waiting_for_input)
+    await message.answer(f"Wybrano: {category}. Wpisz kwotę i info (np. '50 biedronka'):")
 
-@dp.message(F.text.in_(["🍎 Еда", "📦 Прочее"]))
-async def get_category(message: types.Message):
-    uid = message.from_user.id
-    if uid not in ALLOWED_USERS or uid not in user_temp_data: return
+@dp.message(Form.waiting_for_input)
+async def process_expense(message: types.Message, state: FContext):
+    if message.from_user.id not in ALLOWED_USERS: return
     
-    amount = user_temp_data.pop(uid)
-    category = "Еда" if "Еда" in message.text else "Прочее"
+    # Парсим ввод: ищем число в начале строки
+    match = re.match(r"^(\d+(?:[.,]\d+)?)(.*)", message.text.strip())
+    if not match:
+        await message.answer("Błąd! Wpisz najpierw liczbę, a potem info. Spróbuj jeszcze raz:")
+        return
+
+    amount = float(match.group(1).replace(',', '.'))
+    description = match.group(2).strip() or "Brak opisu"
+    
+    data = await state.get_data()
+    category = data.get("selected_category")
     username = message.from_user.first_name
-    
-    db.add_expense(uid, username, category, amount)
-    
-    # Уведомляем ОБОИХ пользователей
-    notif_text = f"💰 <b>Новая трата!</b>\n👤 Кто: {username}\n💵 Сумма: {amount} zł\n📂 Категория: {category}"
-    for user_id in ALLOWED_USERS:
-        try:
-            await bot.send_message(user_id, notif_text, parse_mode="HTML")
-        except:
-            pass
 
-@dp.message(F.text == "📊 Отчет")
+    exp_id = db.add_expense(message.from_user.id, username, category, amount, description)
+    await state.clear()
+
+    notif = f"✅ <b>{username}</b> dodał(a):\n💰 {amount} zł ({category})\n📝 {description}"
+    for uid in ALLOWED_USERS:
+        await bot.send_message(uid, notif, parse_mode="HTML", reply_markup=delete_kb(exp_id))
+
+@dp.callback_query(F.data.startswith("del_"))
+async def delete_item(callback: types.CallbackQuery):
+    exp_id = int(callback.data.split("_")[1])
+    db.delete_expense(exp_id)
+    await callback.message.edit_text("<s>" + callback.message.text + "</s>\n\n🗑 <b>Usunięto!</b>", parse_mode="HTML")
+
+@dp.message(F.text == "📊 Raport")
 async def show_report(message: types.Message):
     if message.from_user.id not in ALLOWED_USERS: return
-    
     start, end = get_current_cycle()
     detailed = db.get_detailed_report(start, end)
     totals = db.get_total_by_category(start, end)
     
-    msg = f"📅 <b>Период:</b> {start[:10]} — {end[:10]}\n\n"
-    
-    if not detailed:
-        await message.answer(msg + "За этот период трат пока нет.")
-        return
-
-    msg += "<b>👤 По пользователям:</b>\n"
+    msg = f"📅 <b>Okres:</b> {start[:10]} — {end[:10]}\n\n"
+    msg += "<b>👤 Użytkownicy:</b>\n"
     for user, cat, amt in detailed:
         msg += f"• {user}: {amt:.2f} zł ({cat})\n"
     
-    msg += "\n<b>📈 Итого по категориям:</b>\n"
-    grand_total = 0
+    msg += "\n<b>📈 Razem kategorie:</b>\n"
+    grand = sum(amt for cat, amt in totals)
     for cat, amt in totals:
         msg += f"▫️ {cat}: {amt:.2f} zł\n"
-        grand_total += amt
-        
-    msg += f"\nИТОГО: <b>{grand_total:.2f} zł</b>"
-    
+    msg += f"\nSUMA: <b>{grand:.2f} zł</b>"
     await message.answer(msg, parse_mode="HTML")
 
-# --- Запуск ---
+@dp.message(F.text == "🕒 Historia")
+async def show_history(message: types.Message):
+    if message.from_user.id not in ALLOWED_USERS: return
+    history = db.get_last_history(10)
+    if not history:
+        await message.answer("Historia jest pusta.")
+        return
+    
+    await message.answer("<b>Ostatnie 10 wpisów:</b>", parse_mode="HTML")
+    for eid, user, cat, amt, desc in history:
+        text = f"{user}: {amt} zł ({cat})\n📝 {desc}"
+        await message.answer(text, reply_markup=delete_kb(eid))
 
+# --- Server ---
 async def handle(request): return web.Response(text="Bot is alive!")
-
 async def main():
     db.init_db()
     app = web.Application()
