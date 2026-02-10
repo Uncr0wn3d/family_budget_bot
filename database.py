@@ -19,19 +19,34 @@ def init_db():
 def add_expense(user_id, username, category, amount):
     with sqlite3.connect('budget.db') as conn:
         cursor = conn.cursor()
-        date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+        # Сохраняем дату в формате YYYY-MM-DD для легкой фильтрации
+        date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         cursor.execute('INSERT INTO expenses (user_id, username, category, amount, date) VALUES (?, ?, ?, ?, ?)',
                        (user_id, username, category, amount, date_str))
         conn.commit()
 
-def get_total():
+def get_detailed_report(start_date, end_date):
+    """Возвращает траты, сгруппированные по пользователю и категории за период"""
     with sqlite3.connect('budget.db') as conn:
         cursor = conn.cursor()
-        cursor.execute('SELECT category, SUM(amount) FROM expenses GROUP BY category')
+        query = '''
+            SELECT username, category, SUM(amount) 
+            FROM expenses 
+            WHERE date >= ? AND date <= ?
+            GROUP BY username, category
+        '''
+        cursor.execute(query, (start_date, end_date))
         return cursor.fetchall()
 
-def get_history(limit=5):
+def get_total_by_category(start_date, end_date):
+    """Возвращает общие суммы по категориям за период"""
     with sqlite3.connect('budget.db') as conn:
         cursor = conn.cursor()
-        cursor.execute('SELECT username, category, amount, date FROM expenses ORDER BY id DESC LIMIT ?', (limit,))
+        query = '''
+            SELECT category, SUM(amount) 
+            FROM expenses 
+            WHERE date >= ? AND date <= ?
+            GROUP BY category
+        '''
+        cursor.execute(query, (start_date, end_date))
         return cursor.fetchall()
