@@ -1,3 +1,4 @@
 aiogram
 aiohttp
 pytz
+psycopg2-binary
