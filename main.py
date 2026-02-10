@@ -1,15 +1,19 @@
 import os
 import asyncio
 import re
+import logging
 from datetime import datetime, timedelta
 import pytz
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.fsm.context import FContext
+from aiogram.fsm.context import FSMContext  # Было FContext, исправил на FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from aiohttp import web
 import database as db
+
+# Настройка логов, чтобы видеть ошибки в панели Render
+logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_USERS = [int(x) for x in os.getenv("ALLOWED_USERS", "").split(",") if x]
@@ -21,7 +25,7 @@ dp = Dispatcher()
 class Form(StatesGroup):
     waiting_for_input = State()
 
-# --- Логика ЗП ---
+# --- Логика расчета периода ЗП ---
 def get_payday(year, month):
     dt = datetime(year, month, 10)
     if dt.weekday() == 5: return dt - timedelta(days=1)
@@ -60,9 +64,8 @@ async def cmd_start(message: types.Message):
     if message.from_user.id not in ALLOWED_USERS: return
     await message.answer("Cześć! Wybierz kategorię:", reply_markup=main_kb())
 
-@dp.message(F.text.in_(["🍎 Jedzenie", "📦 Inне"])) # Принимаем и старый и новый текст для совместимости
 @dp.message(F.text.in_(["🍎 Jedzenie", "📦 Inne"]))
-async def select_category(message: types.Message, state: FContext):
+async def select_category(message: types.Message, state: FSMContext): # Исправлено на FSMContext
     if message.from_user.id not in ALLOWED_USERS: return
     category = "Jedzenie" if "Jedzenie" in message.text else "Inne"
     await state.update_data(selected_category=category)
@@ -70,10 +73,9 @@ async def select_category(message: types.Message, state: FContext):
     await message.answer(f"Wybrano: {category}. Wpisz kwotę i info (np. '50 biedronka'):")
 
 @dp.message(Form.waiting_for_input)
-async def process_expense(message: types.Message, state: FContext):
+async def process_expense(message: types.Message, state: FSMContext): # Исправлено на FSMContext
     if message.from_user.id not in ALLOWED_USERS: return
     
-    # Парсим ввод: ищем число в начале строки
     match = re.match(r"^(\d+(?:[.,]\d+)?)(.*)", message.text.strip())
     if not match:
         await message.answer("Błąd! Wpisz najpierw liczbę, a potem info. Spróbuj jeszcze raz:")
@@ -91,7 +93,10 @@ async def process_expense(message: types.Message, state: FContext):
 
     notif = f"✅ <b>{username}</b> dodał(a):\n💰 {amount} zł ({category})\n📝 {description}"
     for uid in ALLOWED_USERS:
-        await bot.send_message(uid, notif, parse_mode="HTML", reply_markup=delete_kb(exp_id))
+        try:
+            await bot.send_message(uid, notif, parse_mode="HTML", reply_markup=delete_kb(exp_id))
+        except:
+            pass
 
 @dp.callback_query(F.data.startswith("del_"))
 async def delete_item(callback: types.CallbackQuery):
@@ -108,8 +113,11 @@ async def show_report(message: types.Message):
     
     msg = f"📅 <b>Okres:</b> {start[:10]} — {end[:10]}\n\n"
     msg += "<b>👤 Użytkownicy:</b>\n"
-    for user, cat, amt in detailed:
-        msg += f"• {user}: {amt:.2f} zł ({cat})\n"
+    if not detailed:
+        msg += "Brak wpisów в tym okresie."
+    else:
+        for user, cat, amt in detailed:
+            msg += f"• {user}: {amt:.2f} zł ({cat})\n"
     
     msg += "\n<b>📈 Razem kategorie:</b>\n"
     grand = sum(amt for cat, amt in totals)
@@ -131,15 +139,19 @@ async def show_history(message: types.Message):
         text = f"{user}: {amt} zł ({cat})\n📝 {desc}"
         await message.answer(text, reply_markup=delete_kb(eid))
 
-# --- Server ---
-async def handle(request): return web.Response(text="Bot is alive!")
+# --- Веб-сервер для Render ---
+async def handle(request):
+    return web.Response(text="Bot is alive!")
+
 async def main():
     db.init_db()
     app = web.Application()
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
+    # Запуск сервера на порту 8080
     await web.TCPSite(runner, "0.0.0.0", 8080).start()
+    
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
